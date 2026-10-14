@@ -7,11 +7,12 @@ until SteamVR restarts. This relay creates a virtual mouse and a virtual
 keyboard through /dev/uinput once, before SteamVR starts, and feeds them from
 the physical devices as they come and go.
 
-Every USB or Bluetooth mouse and keyboard is a candidate. A physical device is
-identified by its Bluetooth address (EVIOCGUNIQ) or USB bus:vendor:product:name,
-so all its event nodes share one role (the Swiftpoint Z3 has a mouse node and a
-keyboard node for its extra buttons). Roles, from ~/.config/frametop-input.json
-(written by the Frametop Input Settings app):
+Every USB or Bluetooth mouse and keyboard is a candidate, and so is Steam Input's mouse
+(a Steam Controller's trackpad, a uinput device Steam makes). A physical device is
+identified by its Bluetooth address (EVIOCGUNIQ), USB bus:vendor:product:name, or for
+Steam Input's mouse its name, so all its event nodes share one role (the Swiftpoint Z3
+has a mouse node and a keyboard node for its extra buttons). Roles, from
+~/.config/frametop-input.json (written by the Frametop Input Settings app):
   pointer      grabbed; drives the universal 3D mouse (default for devices with a mouse node)
   passthrough  keys go to the desktop; grabbed only while typing goes there, otherwise only observed,
                for the key combinations below (default for keyboards)
@@ -168,6 +169,7 @@ VOLUME_STANDIN = {KEY_MUTE: 0x2AB, KEY_VOLUMEUP: 0x2AC, KEY_VOLUMEDOWN: 0x2AD}
 VOLUME_ORIGINAL = {v: k for k, v in VOLUME_STANDIN.items()}
 VOLUME_CODES = set(VOLUME_STANDIN) | set(VOLUME_ORIGINAL)
 BUS_USB, BUS_BLUETOOTH, BUS_VIRTUAL = 0x03, 0x05, 0x06
+BUS_NAMES = {BUS_USB: "usb", BUS_BLUETOOTH: "bluetooth", BUS_VIRTUAL: "virtual"}
 
 # struct input_event on 64-bit: struct timeval (2 x long), u16 type, u16 code, s32 value.
 EVENT = struct.Struct("llHHi")
@@ -214,6 +216,7 @@ def eviocguniq(length):
 
 
 VIRTUAL_PREFIX = "frametop virtual"
+VALVE = 0x28DE
 RULES_PATH = os.path.expanduser("~/.config/frametop-input.json")
 ACTIONS = ("left", "right", "middle", "back", "scroll_up", "scroll_down", "dashboard", "recenter",
            "pointer_toggle", "follow_toggle", "gaze_toggle", "gaze_precision", "gaze_drag", "gaze_left", "gaze_right",
@@ -759,7 +762,7 @@ class Pointer:
 
 
 class Node:
-    """One input event node: a candidate device (mouse or keyboard, USB or Bluetooth),
+    """One input event node: a candidate device (is_candidate),
     or any other device with volume keys (candidate False, role "volume")."""
 
     def __init__(self, path, fd, name, bus, vendor, product, uniq, is_mouse, is_keyboard,
@@ -769,9 +772,15 @@ class Node:
         self.bus, self.vendor, self.product, self.uniq = bus, vendor, product, uniq
         self.is_mouse, self.is_keyboard = is_mouse, is_keyboard
         self.candidate, self.volume_keys, self.only_volume = candidate, volume_keys, only_volume
-        # One physical device, whatever its node: Bluetooth address, else USB ids plus name.
+        # One physical device, whatever its node: Bluetooth address, else USB ids plus name
+        # (Steam Input's mouse: its name, since its ids are Steam's, not a physical device's).
         base = self.name.split(" Mouse")[0].split(" Keyboard")[0]
-        self.id = uniq.lower() if uniq else f"usb:{vendor:04x}:{product:04x}:{base}"
+        if uniq:
+            self.id = uniq.lower()
+        elif steam_input_mouse(name, bus, vendor, is_mouse):
+            self.id = f"steam:{base}"
+        else:
+            self.id = f"usb:{vendor:04x}:{product:04x}:{base}"
         self.role = None if candidate else "volume"
         self.grabbed = False
         self.remapped = False  # volume keys remapped to their stand-ins
@@ -781,13 +790,25 @@ class Node:
     def describe(self):
         kinds = [k for k, on in (("mouse", self.is_mouse), ("keyboard", self.is_keyboard)) if on]
         return {"path": self.path, "name": self.name, "id": self.id, "uniq": self.uniq,
-                "bus": {BUS_USB: "usb", BUS_BLUETOOTH: "bluetooth"}.get(self.bus, str(self.bus)),
+                "bus": BUS_NAMES.get(self.bus, str(self.bus)),
                 "kinds": kinds, "role": self.role, "grabbed": self.grabbed, "uinput": self.uinput}
 
 
+def steam_input_mouse(name, bus, vendor, is_mouse):
+    """Steam Input's mouse (a Steam Controller's trackpad in its desktop layout): Steam makes
+    it with uinput, so it's on the virtual bus."""
+    return (bus == BUS_VIRTUAL and is_mouse and not name.startswith(VIRTUAL_PREFIX)
+            and (vendor == VALVE or (name.startswith("Valve Software Steam") and name.endswith("Mouse"))))
+
+
+def is_candidate(name, bus, vendor, is_mouse, is_keyboard):
+    """A USB or Bluetooth mouse or keyboard, or Steam Input's mouse."""
+    return ((bus in (BUS_USB, BUS_BLUETOOTH) and (is_mouse or is_keyboard))
+            or steam_input_mouse(name, bus, vendor, is_mouse))
+
+
 def probe(path):
-    """Open a node if it is a USB or Bluetooth mouse or keyboard, or has volume keys,
-    else return None."""
+    """Open a node if it is a candidate (is_candidate) or has volume keys, else return None."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
@@ -810,7 +831,7 @@ def probe(path):
         keys = bits(fd, EV_KEY, KEY_MAX + 1)
         is_mouse = REL_X in bits(fd, EV_REL, REL_MAX + 1)
         is_keyboard = KEY_A in keys
-        candidate = bus in (BUS_USB, BUS_BLUETOOTH) and (is_mouse or is_keyboard)
+        candidate = is_candidate(name, bus, vendor, is_mouse, is_keyboard)
         volume_keys = bool(keys & VOLUME_CODES)  # stand-ins too: kept from before a relay restart
         if not (candidate or volume_keys):
             raise ValueError
